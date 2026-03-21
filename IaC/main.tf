@@ -2,6 +2,8 @@ provider "aws" {
   region = var.region
 }
 
+data "aws_availability_zones" "available" {}
+
 # VPC
 resource "aws_vpc" "main" {
   cidr_block = "10.0.0.0/21"
@@ -26,8 +28,37 @@ resource "aws_subnet" "public" {
   }
 }
 
+# Private Subnet
+resource "aws_subnet" "private" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.1.0/24"
+  map_public_ip_on_launch = false
+  availability_zone       = data.aws_availability_zones.available.names[0]
+
+  tags = {
+    Name = "private-subnet"
+  }
+}
+
+# Second private subnet in a different AZ for RDS AZ coverage
+resource "aws_subnet" "private2" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.2.0/24"
+  map_public_ip_on_launch = false
+  availability_zone       = data.aws_availability_zones.available.names[1]
+
+  tags = {
+    Name = "private-subnet-2"
+  }
+}
+
 # Route Table
 resource "aws_route_table" "public_rt" {
+  vpc_id = aws_vpc.main.id
+}
+
+# Private route table (no IGW)
+resource "aws_route_table" "private_rt" {
   vpc_id = aws_vpc.main.id
 }
 
@@ -42,18 +73,21 @@ resource "aws_route_table_association" "public_assoc" {
   route_table_id = aws_route_table.public_rt.id
 }
 
+resource "aws_route_table_association" "private_assoc" {
+  subnet_id      = aws_subnet.private.id
+  route_table_id = aws_route_table.private_rt.id
+}
+
+resource "aws_route_table_association" "private2_assoc" {
+  subnet_id      = aws_subnet.private2.id
+  route_table_id = aws_route_table.private_rt.id
+}
+
 # Security Group（自分IPのみ）
 resource "aws_security_group" "web_sg" {
   vpc_id = aws_vpc.main.id
 
-  ingress {
-    description = "SSH open"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
+  # Allow HTTP from anywhere
   ingress {
     description = "HTTP open"
     from_port   = 80
@@ -62,13 +96,7 @@ resource "aws_security_group" "web_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  ingress {
-    description = "Postgres open (vulnerable)"
-    from_port   = 5432
-    to_port     = 5432
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  # No SSH (22), SMTP (25), or portmapper (111) ingress — blocked by omission
 
   egress {
     from_port   = 0
@@ -84,44 +112,150 @@ resource "aws_security_group" "web_sg" {
 
 # EC2
 resource "aws_instance" "web" {
-  ami           = data.aws_ami.amazon_linux.id
-  instance_type = "t3.micro"
-  subnet_id     = aws_subnet.public.id
+  ami                    = data.aws_ami.amazon_linux.id
+  instance_type          = "t3.micro"
+  subnet_id              = aws_subnet.public.id
   vpc_security_group_ids = [aws_security_group.web_sg.id]
-  key_name      = var.key_name
+  # Use SSM (Session Manager) for access: attach an instance profile below
+  iam_instance_profile = aws_iam_instance_profile.ec2_ssm_profile.name
 
   user_data = <<-EOF
-              #!/bin/bash
-              # Intentionally vulnerable setup (no system update)
-              yum install -y httpd php postgresql-server nmap
+          #!/bin/bash
+          yum install -y httpd php php-pgsql postgresql nmap
 
-              systemctl start httpd
-              systemctl enable httpd
+          systemctl start httpd
+          systemctl enable httpd
 
-              postgresql-setup initdb
-              systemctl start postgresql
-              systemctl enable postgresql
+          # Give network a moment
+          sleep 10
 
-              # Allow remote connections (vulnerable: listen on all interfaces)
-              sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '*'/" /var/lib/pgsql/data/postgresql.conf || true
-              echo "host all all 0.0.0.0/0 md5" >> /var/lib/pgsql/data/pg_hba.conf || true
+          # Create test table and insert sample rows into RDS
+          export PGPASSWORD="${random_password.db_pw.result}"
+          psql -h ${aws_db_instance.postgres.address} -U dbadmin -d appdb -c "CREATE TABLE IF NOT EXISTS test_data (id serial primary key, msg text);" || true
+          psql -h ${aws_db_instance.postgres.address} -U dbadmin -d appdb -c "INSERT INTO test_data (msg) VALUES ('hello from EC2'), ('another row');" || true
 
-              # Create weak DB user and database
-              sudo -u postgres psql -c "CREATE USER vulnuser WITH PASSWORD 'password';" || true
-              sudo -u postgres psql -c "CREATE DATABASE vuln_db OWNER vulnuser;" || true
+          # PHP page that reads from RDS
+          cat > /var/www/html/index.php <<'PHP'
+          <?php
+          $host = "${aws_db_instance.postgres.address}";
+          $port = 5432;
+          $db   = "appdb";
+          $user = "dbadmin";
+          $pass = "${random_password.db_pw.result}";
 
-              # Simple PHP app (for demonstration)
-              cat > /var/www/html/index.php <<'PHP'
-              <?php
-                phpinfo();
-              ?>
-              PHP
-              EOF
+          try {
+            $dsn = "pgsql:host=$host;port=$port;dbname=$db;";
+            $pdo = new PDO($dsn, $user, $pass, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+            $stmt = $pdo->query('SELECT id, msg FROM test_data ORDER BY id');
+            echo "<h1>Test Data from RDS</h1>";
+            echo "<ul>";
+            while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+              echo "<li>" . htmlspecialchars($row['id']) . ": " . htmlspecialchars($row['msg']) . "</li>";
+            }
+            echo "</ul>";
+          } catch (Exception $e) {
+            echo "<p>Error connecting to DB: " . htmlspecialchars($e->getMessage()) . "</p>";
+          }
+          ?>
+          PHP
+          EOF
 
   tags = {
     Name = "vulnerable-lamp"
     Env  = "lab"
     Risk = "high"
+  }
+}
+
+# IAM role for SSM access
+resource "aws_iam_role" "ec2_ssm_role" {
+  name = "ec2-ssm-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_attach" {
+  role       = aws_iam_role.ec2_ssm_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ec2_ssm_profile" {
+  name = "ec2-ssm-profile"
+  role = aws_iam_role.ec2_ssm_role.name
+}
+
+# RDS security group
+resource "aws_security_group" "rds_sg" {
+  name   = "rds-sg"
+  vpc_id = aws_vpc.main.id
+
+  description = "Allow Postgres access only from web instances"
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# Allow inbound Postgres (5432) from the web SG only
+resource "aws_security_group_rule" "rds_from_web" {
+  type                     = "ingress"
+  from_port                = 5432
+  to_port                  = 5432
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.rds_sg.id
+  source_security_group_id = aws_security_group.web_sg.id
+}
+
+# DB Subnet Group for RDS
+resource "aws_db_subnet_group" "rds_subnet_group" {
+  name       = "rds-subnet-group"
+  subnet_ids = [aws_subnet.private.id, aws_subnet.private2.id]
+
+  tags = {
+    Name = "rds-subnet-group"
+  }
+}
+
+# Random password for the DB
+resource "random_password" "db_pw" {
+  length = 16
+  # Avoid special characters that RDS rejects (/, @, ", space)
+  special = false
+}
+
+# RDS Postgres instance in private subnet
+resource "aws_db_instance" "postgres" {
+  identifier             = "lab-postgres"
+  allocated_storage      = 20
+  engine                 = "postgres"
+  engine_version         = "15"
+  instance_class         = "db.t3.micro"
+  db_name                = "appdb"
+  username               = "dbadmin"
+  password               = random_password.db_pw.result
+  parameter_group_name   = "default.postgres15"
+  db_subnet_group_name   = aws_db_subnet_group.rds_subnet_group.name
+  vpc_security_group_ids = [aws_security_group.rds_sg.id]
+  skip_final_snapshot    = true
+  publicly_accessible    = false
+  multi_az               = false
+  storage_type           = "gp2"
+  tags = {
+    Name = "lab-postgres"
   }
 }
 
