@@ -22,9 +22,22 @@ resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.0.0/24"
   map_public_ip_on_launch = true
+  availability_zone       = data.aws_availability_zones.available.names[0]
 
   tags = {
     Name = "public-subnet"
+  }
+}
+
+# Second public subnet in another AZ for ALB
+resource "aws_subnet" "public2" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.3.0/24"
+  map_public_ip_on_launch = true
+  availability_zone       = data.aws_availability_zones.available.names[1]
+
+  tags = {
+    Name = "public-subnet-2"
   }
 }
 
@@ -73,6 +86,11 @@ resource "aws_route_table_association" "public_assoc" {
   route_table_id = aws_route_table.public_rt.id
 }
 
+resource "aws_route_table_association" "public2_assoc" {
+  subnet_id      = aws_subnet.public2.id
+  route_table_id = aws_route_table.public_rt.id
+}
+
 resource "aws_route_table_association" "private_assoc" {
   subnet_id      = aws_subnet.private.id
   route_table_id = aws_route_table.private_rt.id
@@ -83,20 +101,50 @@ resource "aws_route_table_association" "private2_assoc" {
   route_table_id = aws_route_table.private_rt.id
 }
 
-# Security Group（自分IPのみ）
-resource "aws_security_group" "web_sg" {
+# Elastic IP for NAT Gateway
+resource "aws_eip" "nat_eip" {
+}
+
+# NAT Gateway in the public subnet to give private instances internet access
+resource "aws_nat_gateway" "natgw" {
+  allocation_id = aws_eip.nat_eip.id
+  subnet_id     = aws_subnet.public.id
+  tags = {
+    Name = "nat-gateway"
+  }
+}
+
+# Route for private route table to use NAT Gateway for internet access
+resource "aws_route" "private_default_route" {
+  route_table_id         = aws_route_table.private_rt.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.natgw.id
+}
+
+
+# ALB security group: allow HTTPS from internet
+resource "aws_security_group" "alb_sg" {
+  name   = "alb-sg"
   vpc_id = aws_vpc.main.id
 
-  # Allow HTTP from anywhere
   ingress {
-    description = "HTTP open"
-    from_port   = 80
-    to_port     = 80
+    description = "Allow HTTPS from internet"
+    from_port   = 443
+    to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # No SSH (22), SMTP (25), or portmapper (111) ingress — blocked by omission
+  # Leave egress unspecified so default allows outbound to instances
+
+  tags = {
+    Name = "alb-sg"
+  }
+}
+
+# Security Group for EC2 web instances: allow HTTP only from the ALB
+resource "aws_security_group" "web_sg" {
+  vpc_id = aws_vpc.main.id
 
   egress {
     from_port   = 0
@@ -110,18 +158,29 @@ resource "aws_security_group" "web_sg" {
   }
 }
 
+# Allow HTTP (80) from ALB security group to web instances
+resource "aws_security_group_rule" "web_from_alb" {
+  type                     = "ingress"
+  from_port                = 80
+  to_port                  = 80
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.web_sg.id
+  source_security_group_id = aws_security_group.alb_sg.id
+}
+
 # EC2
 resource "aws_instance" "web" {
   ami                    = data.aws_ami.amazon_linux.id
   instance_type          = "t3.micro"
-  subnet_id              = aws_subnet.public.id
+  subnet_id              = aws_subnet.private.id
   vpc_security_group_ids = [aws_security_group.web_sg.id]
   # Use SSM (Session Manager) for access: attach an instance profile below
   iam_instance_profile = aws_iam_instance_profile.ec2_ssm_profile.name
 
   user_data = <<-EOF
           #!/bin/bash
-          yum install -y httpd php php-pgsql postgresql nmap
+          amazon-linux-extras install postgresql14
+          yum install -y httpd php php-pgsql nmap
 
           systemctl start httpd
           systemctl enable httpd
@@ -158,6 +217,16 @@ resource "aws_instance" "web" {
           }
           ?>
           PHP
+
+          systemctl stop sshd
+          systemctl disable sshd
+          systemctl stop postfix
+          systemctl disable postfix
+          systemctl stop rpcbind.socket
+          systemctl disable rpcbind.socket
+          systemctl stop rpcbind.service
+          systemctl disable rpcbind.service
+
           EOF
 
   tags = {
@@ -218,6 +287,72 @@ resource "aws_security_group_rule" "rds_from_web" {
   protocol                 = "tcp"
   security_group_id        = aws_security_group.rds_sg.id
   source_security_group_id = aws_security_group.web_sg.id
+}
+
+# Application Load Balancer
+resource "aws_lb" "alb" {
+  name               = "app-alb"
+  internal           = false
+  load_balancer_type = "application"
+  subnets            = [aws_subnet.public.id, aws_subnet.public2.id]
+  security_groups    = [aws_security_group.alb_sg.id]
+  tags = {
+    Name = "app-alb"
+  }
+}
+
+# Target group for ALB -> instances on port 80
+resource "aws_lb_target_group" "web_tg" {
+  name     = "web-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.main.id
+
+  health_check {
+    path                = "/"
+    matcher             = "200-399"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+  }
+}
+
+# Listener for HTTPS on ALB — expects you to wire a certificate ARN if you have one
+
+# HTTP listener for ALB (useful for health checks / lab testing)
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.alb.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.web_tg.arn
+  }
+}
+
+# Optional HTTPS listener: created only when a certificate ARN is provided
+resource "aws_lb_listener" "https" {
+  count             = var.alb_certificate_arn != "" ? 1 : 0
+  load_balancer_arn = aws_lb.alb.arn
+  port              = "443"
+  protocol          = "HTTPS"
+
+  ssl_policy     = "ELBSecurityPolicy-2016-08"
+  certificate_arn = var.alb_certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.web_tg.arn
+  }
+}
+
+# Attach instance to target group
+resource "aws_lb_target_group_attachment" "web_attachment" {
+  target_group_arn = aws_lb_target_group.web_tg.arn
+  target_id        = aws_instance.web.id
+  port             = 80
 }
 
 # DB Subnet Group for RDS

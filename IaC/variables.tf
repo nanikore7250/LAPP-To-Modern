@@ -9,3 +9,8 @@ variable "my_ip" {
 variable "key_name" {
   description = "ltm-key"
 }
+
+variable "alb_certificate_arn" {
+  description = "ARN of ACM certificate to use for ALB HTTPS. Leave empty to skip HTTPS listener."
+  default     = ""
+}
