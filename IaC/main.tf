@@ -128,6 +128,14 @@ resource "aws_security_group" "alb_sg" {
   vpc_id = aws_vpc.main.id
 
   ingress {
+    description = "Allow HTTP from internet"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
     description = "Allow HTTPS from internet"
     from_port   = 443
     to_port     = 443
@@ -135,7 +143,12 @@ resource "aws_security_group" "alb_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # Leave egress unspecified so default allows outbound to instances
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 
   tags = {
     Name = "alb-sg"
@@ -179,28 +192,42 @@ resource "aws_instance" "web" {
 
   user_data = <<-EOF
           #!/bin/bash
-          amazon-linux-extras install postgresql14
-          yum install -y httpd php php-pgsql nmap
+          dnf install -y httpd php php-pgsql postgresql15
 
           systemctl start httpd
           systemctl enable httpd
 
-          # Give network a moment
+          # Fetch DB password from SSM Parameter Store at boot time (not baked into image)
+          DB_PASS=$(aws ssm get-parameter \
+            --name "/lab/db/password" \
+            --with-decryption \
+            --query "Parameter.Value" \
+            --output text \
+            --region ${var.region})
+
+          # Write password to a config file outside the web root
+          mkdir -p /etc/php-app
+          printf '<?php\ndefine("DB_PASS", "%s");\n' "$DB_PASS" > /etc/php-app/db_config.php
+          chmod 600 /etc/php-app/db_config.php
+
+          # Give RDS a moment to become available
           sleep 10
 
           # Create test table and insert sample rows into RDS
-          export PGPASSWORD="${random_password.db_pw.result}"
+          export PGPASSWORD="$DB_PASS"
           psql -h ${aws_db_instance.postgres.address} -U dbadmin -d appdb -c "CREATE TABLE IF NOT EXISTS test_data (id serial primary key, msg text);" || true
           psql -h ${aws_db_instance.postgres.address} -U dbadmin -d appdb -c "INSERT INTO test_data (msg) VALUES ('hello from EC2'), ('another row');" || true
 
-          # PHP page that reads from RDS
+          # PHP page that reads from RDS (password loaded from config file, not hardcoded)
           cat > /var/www/html/index.php <<'PHP'
           <?php
+          require '/etc/php-app/db_config.php';
+
           $host = "${aws_db_instance.postgres.address}";
           $port = 5432;
           $db   = "appdb";
           $user = "dbadmin";
-          $pass = "${random_password.db_pw.result}";
+          $pass = DB_PASS;
 
           try {
             $dsn = "pgsql:host=$host;port=$port;dbname=$db;";
@@ -339,7 +366,7 @@ resource "aws_lb_listener" "https" {
   port              = "443"
   protocol          = "HTTPS"
 
-  ssl_policy     = "ELBSecurityPolicy-2016-08"
+  ssl_policy     = "ELBSecurityPolicy-TLS13-1-2-2021-06"
   certificate_arn = var.alb_certificate_arn
 
   default_action {
@@ -372,6 +399,28 @@ resource "random_password" "db_pw" {
   special = false
 }
 
+# Store DB password in SSM Parameter Store (SecureString)
+resource "aws_ssm_parameter" "db_password" {
+  name  = "/lab/db/password"
+  type  = "SecureString"
+  value = random_password.db_pw.result
+}
+
+# Allow EC2 to fetch the DB password from SSM
+resource "aws_iam_role_policy" "ec2_get_db_param" {
+  name = "ec2-get-db-param"
+  role = aws_iam_role.ec2_ssm_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ssm:GetParameter"]
+      Resource = aws_ssm_parameter.db_password.arn
+    }]
+  })
+}
+
 # RDS Postgres instance in private subnet
 resource "aws_db_instance" "postgres" {
   identifier             = "lab-postgres"
@@ -394,13 +443,13 @@ resource "aws_db_instance" "postgres" {
   }
 }
 
-# Amazon Linux AMI
+# Amazon Linux 2023 AMI
 data "aws_ami" "amazon_linux" {
   most_recent = true
   owners      = ["amazon"]
 
   filter {
     name   = "name"
-    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+    values = ["al2023-ami-*-x86_64"]
   }
 }
