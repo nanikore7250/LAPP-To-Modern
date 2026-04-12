@@ -2,7 +2,6 @@ variable "region" {
   default = "ap-northeast-1"
 }
 
-variable "alb_certificate_arn" {
-  description = "ARN of ACM certificate to use for ALB HTTPS. Leave empty to skip HTTPS listener."
-  default     = ""
+variable "domain_name" {
+  description = "Route 53で管理するドメイン名 (例: example.com)"
 }

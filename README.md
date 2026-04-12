@@ -10,3 +10,7 @@ AWS上にLAPP環境を構築し、少しずつモダナイズしていく
 セキュリティも少しずつ考えていくため、脆弱な状態もあり得る。
 
 そのまま放置するのはあまりにも危険なため、IaCに逃がす。
+
+ terraform apply -target=aws_acm_certificate.cert 
+ terraform apply
+ terraform destroy

@@ -375,29 +375,87 @@ resource "aws_lb_target_group" "web_tg" {
   }
 }
 
-# Listener for HTTPS on ALB — expects you to wire a certificate ARN if you have one
+# Route 53 hosted zone
+resource "aws_route53_zone" "main" {
+  name = var.domain_name
 
-# HTTP listener for ALB (useful for health checks / lab testing)
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# ACM certificate (DNS validation)
+resource "aws_acm_certificate" "cert" {
+  domain_name               = var.domain_name
+  subject_alternative_names = ["www.${var.domain_name}"]
+  validation_method         = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# DNS validation records in Route 53
+resource "aws_route53_record" "cert_validation" {
+  for_each = {
+    for dvo in aws_acm_certificate.cert.domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  }
+
+  allow_overwrite = true
+  name            = each.value.name
+  records         = [each.value.record]
+  ttl             = 60
+  type            = each.value.type
+  zone_id         = aws_route53_zone.main.zone_id
+}
+
+# Wait for ACM certificate validation to complete
+resource "aws_acm_certificate_validation" "cert" {
+  certificate_arn         = aws_acm_certificate.cert.arn
+  validation_record_fqdns = [for record in aws_route53_record.cert_validation : record.fqdn]
+}
+
+# Route 53 A record: domain → ALB
+resource "aws_route53_record" "alb" {
+  zone_id = aws_route53_zone.main.zone_id
+  name    = var.domain_name
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.alb.dns_name
+    zone_id                = aws_lb.alb.zone_id
+    evaluate_target_health = true
+  }
+}
+
+# HTTP listener: redirect all traffic to HTTPS
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.alb.arn
   port              = "80"
   protocol          = "HTTP"
 
   default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.web_tg.arn
+    type = "redirect"
+
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
   }
 }
 
-# Optional HTTPS listener: created only when a certificate ARN is provided
+# HTTPS listener: forward to target group using ACM certificate
 resource "aws_lb_listener" "https" {
-  count             = var.alb_certificate_arn != "" ? 1 : 0
   load_balancer_arn = aws_lb.alb.arn
   port              = "443"
   protocol          = "HTTPS"
-
-  ssl_policy     = "ELBSecurityPolicy-TLS13-1-2-2021-06"
-  certificate_arn = var.alb_certificate_arn
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = aws_acm_certificate_validation.cert.certificate_arn
 
   default_action {
     type             = "forward"

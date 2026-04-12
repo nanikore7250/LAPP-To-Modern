@@ -1,6 +1,11 @@
-output "alb_dns_name" {
-  description = "ALB DNS name — open this URL in a browser to reach the app"
-  value       = "http://${aws_lb.alb.dns_name}"
+output "app_url" {
+  description = "アプリのURL (HTTPS)"
+  value       = "https://${var.domain_name}"
+}
+
+output "route53_nameservers" {
+  description = "お名前.comのネームサーバー設定に使用するNSレコード"
+  value       = aws_route53_zone.main.name_servers
 }
 
 output "rds_endpoint" {
