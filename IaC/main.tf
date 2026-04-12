@@ -192,10 +192,8 @@ resource "aws_instance" "web" {
 
   user_data = <<-EOF
           #!/bin/bash
-          dnf install -y httpd php php-pgsql postgresql15
-
-          systemctl start httpd
-          systemctl enable httpd
+          dnf install -y nginx python3 python3-pip postgresql15
+          pip3 install fastapi uvicorn psycopg2-binary
 
           # Fetch DB password from SSM Parameter Store at boot time (not baked into image)
           DB_PASS=$(aws ssm get-parameter \
@@ -205,10 +203,10 @@ resource "aws_instance" "web" {
             --output text \
             --region ${var.region})
 
-          # Write password to a config file outside the web root
-          mkdir -p /etc/php-app
-          printf '<?php\ndefine("DB_PASS", "%s");\n' "$DB_PASS" > /etc/php-app/db_config.php
-          chmod 600 /etc/php-app/db_config.php
+          # Write password to a file outside the web root
+          mkdir -p /etc/app
+          printf '%s' "$DB_PASS" > /etc/app/db_password
+          chmod 600 /etc/app/db_password
 
           # Give RDS a moment to become available
           sleep 10
@@ -216,34 +214,67 @@ resource "aws_instance" "web" {
           # Create test table and insert sample rows into RDS
           export PGPASSWORD="$DB_PASS"
           psql -h ${aws_db_instance.postgres.address} -U dbadmin -d appdb -c "CREATE TABLE IF NOT EXISTS test_data (id serial primary key, msg text);" || true
-          psql -h ${aws_db_instance.postgres.address} -U dbadmin -d appdb -c "INSERT INTO test_data (msg) VALUES ('hello from EC2'), ('another row');" || true
+          psql -h ${aws_db_instance.postgres.address} -U dbadmin -d appdb -c "INSERT INTO test_data (msg) VALUES ('hello from FastAPI'), ('another row');" || true
 
-          # PHP page that reads from RDS (password loaded from config file, not hardcoded)
-          cat > /var/www/html/index.php <<'PHP'
-          <?php
-          require '/etc/php-app/db_config.php';
+          # FastAPI app
+          mkdir -p /opt/app
+          cat > /opt/app/main.py <<'PYTHON'
+          import psycopg2
+          from fastapi import FastAPI
 
-          $host = "${aws_db_instance.postgres.address}";
-          $port = 5432;
-          $db   = "appdb";
-          $user = "dbadmin";
-          $pass = DB_PASS;
+          app = FastAPI()
 
-          try {
-            $dsn = "pgsql:host=$host;port=$port;dbname=$db;";
-            $pdo = new PDO($dsn, $user, $pass, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-            $stmt = $pdo->query('SELECT id, msg FROM test_data ORDER BY id');
-            echo "<h1>Test Data from RDS</h1>";
-            echo "<ul>";
-            while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-              echo "<li>" . htmlspecialchars($row['id']) . ": " . htmlspecialchars($row['msg']) . "</li>";
-            }
-            echo "</ul>";
-          } catch (Exception $e) {
-            echo "<p>Error connecting to DB: " . htmlspecialchars($e->getMessage()) . "</p>";
+          DB_HOST = "${aws_db_instance.postgres.address}"
+          DB_NAME = "appdb"
+          DB_USER = "dbadmin"
+          DB_PASS = open("/etc/app/db_password").read().strip()
+
+          @app.get("/")
+          def get_data():
+              conn = psycopg2.connect(host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=DB_PASS)
+              cur = conn.cursor()
+              cur.execute("SELECT id, msg FROM test_data ORDER BY id")
+              rows = cur.fetchall()
+              cur.close()
+              conn.close()
+              return {"data": [{"id": r[0], "msg": r[1]} for r in rows]}
+          PYTHON
+
+          # nginx as reverse proxy to uvicorn
+          cat > /etc/nginx/conf.d/app.conf <<'NGINX'
+          server {
+              listen 80;
+              location / {
+                  proxy_pass http://127.0.0.1:8000;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
           }
-          ?>
-          PHP
+          NGINX
+
+          # Disable default nginx server block to avoid port conflict
+          sed -i 's/^\(\s*listen\s\+80\)/# \1/' /etc/nginx/nginx.conf
+
+          # systemd service for uvicorn
+          cat > /etc/systemd/system/app.service <<'SERVICE'
+          [Unit]
+          Description=FastAPI app via uvicorn
+          After=network.target
+
+          [Service]
+          ExecStart=/usr/local/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+          WorkingDirectory=/opt/app
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+          systemctl daemon-reload
+          systemctl enable app
+          systemctl start app
+          systemctl enable nginx
+          systemctl start nginx
 
           systemctl stop sshd
           systemctl disable sshd
@@ -257,9 +288,8 @@ resource "aws_instance" "web" {
           EOF
 
   tags = {
-    Name = "vulnerable-lamp"
+    Name = "fastapi-app"
     Env  = "lab"
-    Risk = "high"
   }
 }
 
